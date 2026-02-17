@@ -19,19 +19,16 @@ except ImportError:
     RADAR_LIB_AVAILABLE = False
 
 # ===================== USER CONFIG =====================
-CLI_PORT = "ttyUSB0"
-DATA_PORT = "ttyUSB1"
+CLI_PORT = "COM10"
+DATA_PORT = "COM11"
 CFG_FILE = "ti_radar/chirp_config/profile_3d_isk.cfg"
-
-TREADMILL_MIN_DIST = 0.5  # meters
-TREADMILL_MAX_DIST = 2.0  # meters
+MAX_RANGE_METERS = 5.0 
 # ======================================================
 
-# Fallback styles to mimic your core.settings
 WINDOW_WIDTH, WINDOW_HEIGHT = 1000, 600
 MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT = 800, 500
 TEXT_DIM = "#888888"
-VERSION = "v1.1.0-Radar"
+VERSION = "v1.3.0-Pure-Heatmap"
 
 STYLESHEET = """
 QMainWindow { background-color: #1e1e1e; color: #ffffff; }
@@ -48,11 +45,8 @@ QPushButton#RecBtn[recording="true"]:hover { background-color: #f44336; }
 """
 
 class RadarWorker(QThread):
-    """
-    Background thread that reads UART. 
-    Emits point cloud for UI calibration, and saves RDHM internally when recording.
-    """
-    new_points = pyqtSignal(np.ndarray)
+    # Emits the full 2D matrix: (Range, Velocity)
+    new_heatmap = pyqtSignal(np.ndarray)
     
     def __init__(self, radar_sensor):
         super().__init__()
@@ -63,31 +57,48 @@ class RadarWorker(QThread):
         self.is_recording = False
         self.recorded_session_rdhm = []
         self.recorded_session_timestamps = []
+        
+        # Matrix Dimensions
+        self.num_range_bins = self.radar.config.ADCsamples
+        self.num_vel_bins = self.radar.config.numLoops
+
+        self.num_range_bins = self.radar.config.ADCsamples
+        self.num_vel_bins = self.radar.config.numLoops
+        
+        # Calculate exactly which row index equals MAX_RANGE_METERS
+        self.max_bin = min(int(MAX_RANGE_METERS / self.radar.config.rangeRes), self.num_range_bins)
 
     def run(self):
         while self.is_running:
             try:
                 frame = self.radar.get_next_frame()
-                if not frame: continue
+                if not frame or frame.get("RDHM") is None: 
+                    continue
                 
-                # 1. Emit Point Cloud for Calibration Preview
-                if frame.get("pointCloud") is not None and len(frame["pointCloud"]) > 0:
-                    # Point cloud shape: [numPoints, 7] -> X, Y, Z, Doppler, SNR, Noise, Track
-                    # We just need X and Y for the overhead calibration view
-                    pts = np.array(frame["pointCloud"])
-                    self.new_points.emit(pts[:, 0:2]) # Send [X, Y]
-                else:
-                    self.new_points.emit(np.empty((0, 2)))
+                raw_rdhm = frame["RDHM"]
+                
+                if raw_rdhm.size == (self.num_range_bins * self.num_vel_bins):
+                    # 1. Reshape to 2D first
+                    rd_matrix = np.array(raw_rdhm, dtype=np.float32).reshape(self.num_range_bins, self.num_vel_bins)
+                    
+                    # 2. Crop the top off the matrix!
+                    rd_matrix_cropped = rd_matrix[:self.max_bin, :]
+                    
+                    # 3. Save the *cropped* raw data (Saves 50%+ RAM and disk space)
+                    if self.is_recording:
+                        self.recorded_session_rdhm.append(np.copy(rd_matrix_cropped))
+                        self.recorded_session_timestamps.append(time.time())
 
-                # 2. Save heavy raw data ONLY if recording
-                if self.is_recording and frame.get("RDHM"):
-                    rd_matrix = np.array(frame["RDHM"], dtype=np.uint16)
-                    # Fast append without doing any heavy FFT math
-                    self.recorded_session_rdhm.append(rd_matrix)
-                    self.recorded_session_timestamps.append(time.time())
+                    # 4. Process Data for UI Heatmap
+                    # Use the cropped matrix for the FFT shift and log conversion
+                    ui_matrix = np.fft.fftshift(rd_matrix_cropped, axes=1)
+                    ui_matrix = 20 * np.log10(np.abs(ui_matrix) + 1e-6)
+                    
+                    self.new_heatmap.emit(ui_matrix)
 
             except Exception as e:
-                pass
+                print(f"Worker Error: {e}")
+
 
     def start_recording(self):
         self.recorded_session_rdhm = []
@@ -110,18 +121,14 @@ class RadarRecorderApp(QMainWindow):
         self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.setMinimumSize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         
-        # State
         self.is_recording = False
         self.frame_count = 0
         self.prev_time = 0
         self.radar = None
         self.worker = None
         
-        # UI Setup
         self._init_ui()
         self.setStyleSheet(STYLESHEET)
-
-        # OPTIMIZATION: Schedule heavy loading AFTER window shows
         QTimer.singleShot(100, self.load_heavy_components)
 
     def load_heavy_components(self):
@@ -138,9 +145,20 @@ class RadarRecorderApp(QMainWindow):
             
             self.lbl_video.hide()
             self.plot_widget.show()
+
+            # Calculate the exact physical range of the cropped bins
+            max_bin = min(int(MAX_RANGE_METERS / self.radar.config.rangeRes), self.radar.config.ADCsamples)
+            actual_max_range = max_bin * self.radar.config.rangeRes
+            
+            max_vel = (self.radar.config.numLoops / 2.0) * self.radar.config.dopRes
+            dop_res = self.radar.config.dopRes
+            
+            # Use actual_max_range for the bounding box height
+            self.rect = QRectF(-max_vel - (dop_res / 2.0), 0, max_vel * 2, actual_max_range)
+            self.image_item.setRect(self.rect)
             
             self.worker = RadarWorker(self.radar)
-            self.worker.new_points.connect(self.update_loop)
+            self.worker.new_heatmap.connect(self.update_loop)
             self.worker.start()
 
         except Exception as e:
@@ -231,7 +249,7 @@ class RadarRecorderApp(QMainWindow):
 
         main_layout.addWidget(self.sidebar)
 
-        # CALIBRATION AREA
+        # 2D HEATMAP AREA
         self.video_container = QWidget()
         self.video_container.setStyleSheet("background-color: black;")
         video_layout = QVBoxLayout(self.video_container)
@@ -241,24 +259,20 @@ class RadarRecorderApp(QMainWindow):
         self.lbl_video.setAlignment(Qt.AlignmentFlag.AlignCenter)
         video_layout.addWidget(self.lbl_video)
 
-        # --- Top-Down Calibration Plot Setup ---
-        self.plot_widget = pg.PlotWidget(title="Calibration Preview (Top-Down Overhead View)")
-        self.plot_widget.setLabel('left', 'Distance from Radar (Y)', units='m')
-        self.plot_widget.setLabel('bottom', 'Left/Right Offset (X)', units='m')
-        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
-        self.plot_widget.setXRange(-1.5, 1.5)
-        self.plot_widget.setYRange(0, 3.0)
+        # PyQtGraph Image Setup
+        pg.setConfigOptions(imageAxisOrder='row-major')
+        self.plot_widget = pg.PlotWidget(title="Live Range-Doppler Heatmap")
+        self.plot_widget.setLabel('left', 'Range (Distance)', units='m')
+        self.plot_widget.setLabel('bottom', 'Velocity (Speed)', units='m/s')
         
-        # Draw a box representing the Treadmill Target Zone
-        target_zone = QGraphicsRectItem(-0.5, TREADMILL_MIN_DIST, 1.0, TREADMILL_MAX_DIST - TREADMILL_MIN_DIST)
-        target_zone.setPen(pg.mkPen('g', width=2, style=Qt.PenStyle.DashLine))
-        target_zone.setBrush(pg.mkBrush(0, 255, 0, 30)) # Transparent green fill
-        self.plot_widget.addItem(target_zone)
+        # Add a center line to easily see 0 m/s (Stationary objects)
+        v_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('w', style=Qt.PenStyle.DashLine, alpha=100))
+        self.plot_widget.addItem(v_line)
         
-        # Scatter plot for the actual radar points
-        self.scatter = pg.ScatterPlotItem(size=8, pen=pg.mkPen(None), brush=pg.mkBrush(255, 255, 255, 200))
-        self.plot_widget.addItem(self.scatter)
-        self.plot_widget.hide() # Hidden until loaded
+        self.image_item = pg.ImageItem()
+        self.image_item.setColorMap(pg.colormap.get('inferno'))
+        self.plot_widget.addItem(self.image_item)
+        self.plot_widget.hide() 
 
         video_layout.addWidget(self.plot_widget)
         main_layout.addWidget(self.video_container)
@@ -273,23 +287,22 @@ class RadarRecorderApp(QMainWindow):
     def toggle_recording(self):
         if not self.worker: return 
 
-        if not self.is_recording:
-            s = self.inp_subject.text().strip()
-            a = self.inp_activity.text().strip()
-            t = self.inp_temp.text().strip()
+        # FIX: Grab the text values at the very beginning of the function
+        s = self.inp_subject.text().strip()
+        a = self.inp_activity.text().strip()
+        t = self.inp_temp.text().strip()
 
+        if not self.is_recording:
             if not all([s, a, t]):
                 self.lbl_error.setText("⚠ MISSING FIELDS")
                 return
             self.lbl_error.setText("")
             
-            # Start Recording
             self.is_recording = True
             self.frame_count = 0
             self.worker.start_recording()
             self._set_inputs_enabled(False)
             
-            # Update UI Button
             self.btn_record.setText("STOP")
             self.btn_record.setProperty("recording", True)
             self.btn_record.style().unpolish(self.btn_record)
@@ -298,7 +311,6 @@ class RadarRecorderApp(QMainWindow):
             self.plot_widget.setTitle("<span style='color: red;'>RECORDING IN PROGRESS...</span>")
             
         else:
-            # Stop Recording
             self.is_recording = False
             rdhm_data, timestamps = self.worker.stop_recording()
             
@@ -308,11 +320,11 @@ class RadarRecorderApp(QMainWindow):
             self.btn_record.setProperty("recording", False)
             self.btn_record.style().unpolish(self.btn_record)
             self.btn_record.style().polish(self.btn_record)
-            self.plot_widget.setTitle("Calibration Preview (Top-Down Overhead View)")
+            self.plot_widget.setTitle("Live Range-Doppler Heatmap")
             
-            # Save the file using standard numpy zip (.npz)
             if len(rdhm_data) > 0:
-                filename = f"radar_{self.inp_subject.text()}_{self.inp_activity.text()}_{int(time.time())}.npz"
+                # s, a, and t are now safely accessible here!
+                filename = f"radar_{s}_{a}_{int(time.time())}.npz"
                 np.savez_compressed(
                     filename,
                     rdhm=np.array(rdhm_data), 
@@ -328,12 +340,11 @@ class RadarRecorderApp(QMainWindow):
                 )
                 self.lbl_error.setStyleSheet("color: #4CAF50;")
                 self.lbl_error.setText(f"Saved: {filename}")
-
     def _set_inputs_enabled(self, enabled):
         for w in [self.inp_subject, self.inp_activity, self.inp_temp, self.cmb_model]:
             w.setEnabled(enabled)
 
-    def update_loop(self, points):
+    def update_loop(self, heatmap_matrix):
         # Calculate FPS
         t = time.time()
         dt = t - self.prev_time
@@ -341,14 +352,18 @@ class RadarRecorderApp(QMainWindow):
         self.prev_time = t
         self.lbl_fps.setText(f"FPS: {fps:.1f}")
 
-        # Update Calibration View
-        if len(points) > 0:
-            # points[:, 0] is X (Left/Right offset), points[:, 1] is Y (Distance)
-            self.scatter.setData(points[:, 0], points[:, 1])
-        else:
-            self.scatter.clear()
+        # Set the single 2D frame
+        self.image_item.setImage(heatmap_matrix, autoLevels=False)
+        
+        # Fix: Reapply bounding box
+        if hasattr(self, 'rect'):
+            self.image_item.setRect(self.rect)
+        
+        # Dynamic contrast: Hide the bottom 40% noise so moving feet pop out
+        vmin = np.percentile(heatmap_matrix, 40)
+        vmax = np.percentile(heatmap_matrix, 99.5)
+        self.image_item.setLevels((vmin, vmax))
 
-        # Update frame counter if recording
         if self.is_recording:
             self.frame_count += 1
             self.lbl_frames.setText(f"Frames: {self.frame_count}")

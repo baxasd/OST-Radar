@@ -61,10 +61,12 @@ class RadarSensor:
                 if index == 8:
                     break
             else:
-                if index == 0:
-                    magicByte = self.data_com.read(1)
+                # Fix: Reset search, but check if the current byte starts a NEW sequence
                 index = 0
                 frameData = bytearray()
+                if magicByte[0] == self.UART_MAGIC_WORD[0]:
+                    index = 1
+                    frameData.append(magicByte[0])
 
         # 2. Read Header Info (Version + Length)
         versionBytes = self.data_com.read(4)

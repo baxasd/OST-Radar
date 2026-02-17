@@ -16,9 +16,9 @@ def parsePointCloudTLV(tlvData, tlvLength, outputDict):
 
 def parseDopplerTLV(tlvData, tlvLength, outputDict):
     try:
-        # SUPER FAST UNPACKING: 
-        # Instantly reads the byte array as uint16 instead of a slow for-loop
-        rdhm = np.frombuffer(tlvData, dtype=np.uint16).tolist()
+        # SUPER FAST UNPACKING FIX: 
+        # Keeps as numpy array, uses .copy() instead of converting to Python list
+        rdhm = np.frombuffer(tlvData, dtype=np.uint16).copy()
         outputDict['RDHM'] = rdhm
     except Exception as e:
         log.error(f'RDHM TLV Parser Failed: {e}')
