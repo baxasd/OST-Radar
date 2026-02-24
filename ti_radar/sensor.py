@@ -2,13 +2,13 @@ import serial
 from serial.tools import list_ports
 import time
 import logging
-import platform
-from .config import RadarConfig
-from .parser import parse_standard_frame
+from ti_radar.config import RadarConfig
+from ti_radar.parser import parse_standard_frame
 
 log = logging.getLogger(__name__)
 
 class RadarSensor:
+    # 8-byte sequence marking the absolute start of a new data frame
     UART_MAGIC_WORD = bytearray(b'\x02\x01\x04\x03\x06\x05\x08\x07')
 
     def __init__(self, cli_port, data_port, config_file):
@@ -19,7 +19,7 @@ class RadarSensor:
         self.data_com = None
 
     def connect_and_configure(self):
-        """Opens serial ports and sends configuration"""
+        """Opens serial ports and flashes the CFG profile to the radar's DSP"""
         self.cli_com = serial.Serial(self.cli_port_name, 115200, timeout=0.6)
         self.data_com = serial.Serial(self.data_port_name, 921600, timeout=0.6)
         self.data_com.reset_output_buffer()
@@ -28,13 +28,15 @@ class RadarSensor:
         self.config.print_summary()
 
     def _send_cfg(self):
+        """Sends commands line-by-line via the CLI port"""
         with open(self.config.file_path, "r") as f:
-            lines = [line for line in f.readlines() if line.strip() and not line.startswith('%')]
+            lines = [line.strip() for line in f if line.strip() and not line.startswith('%')]
 
         for line in lines:
             time.sleep(0.03)
-            self.cli_com.write((line.strip() + '\n').encode())
-            # Read acks
+            self.cli_com.write((line + '\n').encode())
+            
+            # Flush acks from hardware
             self.cli_com.readline()
             self.cli_com.readline()
 
@@ -45,78 +47,68 @@ class RadarSensor:
         self.cli_com.reset_input_buffer()
 
     def read_raw_frame(self):
-        """Hunts for the magic word and extracts exactly one raw byte frame"""
+        """Scans the UART stream until it locks onto a Magic Word, then reads exactly one frame."""
         index = 0
         frameData = bytearray()
         
-        # 1. Hunt for the magic word sequence
+        # 1. Hunt for the magic word to sync with the hardware stream
         while True:
             magicByte = self.data_com.read(1)
             if not magicByte:
-                return None # Timeout
+                return None 
 
             if magicByte[0] == self.UART_MAGIC_WORD[index]:
                 index += 1
                 frameData.append(magicByte[0])
-                if index == 8:
+                if index == len(self.UART_MAGIC_WORD):
                     break
             else:
-                # Fix: Reset search, but check if the current byte starts a NEW sequence
-                index = 0
-                frameData = bytearray()
-                if magicByte[0] == self.UART_MAGIC_WORD[0]:
-                    index = 1
-                    frameData.append(magicByte[0])
+                # Mismatch found. Reset search, but check if this mismatched byte 
+                # is actually the start of a brand new sequence to prevent dropped frames.
+                index = 1 if magicByte[0] == self.UART_MAGIC_WORD[0] else 0
+                frameData = bytearray([magicByte[0]]) if index == 1 else bytearray()
 
-        # 2. Read Header Info (Version + Length)
+        # 2. Extract frame length
         versionBytes = self.data_com.read(4)
         lengthBytes = self.data_com.read(4)
         
         if len(versionBytes) < 4 or len(lengthBytes) < 4:
-            return None # Dropped payload immediately after magic word
+            return None 
             
-        frameData += bytearray(versionBytes) + bytearray(lengthBytes)
+        frameData.extend(versionBytes)
+        frameData.extend(lengthBytes)
         
         frameLength = int.from_bytes(lengthBytes, byteorder='little')
         
-        # 3. Sanity check: If a frame claims to be an absurd size (corruption), reject it
-        if frameLength > 100000 or frameLength < 16:
+        # 3. Size sanity check (reject corrupt packets)
+        if not (16 <= frameLength <= 100000):
             return None
             
-        bytes_to_read = frameLength - 16 # Subtract bytes already read
-        payload = bytearray()
-        
-        # 4. CRITICAL FIX 3: Loop until the exact number of bytes are pulled from the buffer
+        # 4. Pull the exact payload size to ensure we don't bleed into the next frame
+        bytes_to_read = frameLength - 16 
         while bytes_to_read > 0:
             chunk = self.data_com.read(bytes_to_read)
             if not chunk: 
-                return None # Hardware timeout halfway through frame
-            payload += bytearray(chunk)
+                return None
+            frameData.extend(chunk)
             bytes_to_read -= len(chunk)
             
-        frameData += payload
         return frameData
 
     def get_next_frame(self):
-        """Fetches raw bytes and parses them into usable data"""
+        """Fetches and parses a single frame dictionary"""
         raw_bytes = self.read_raw_frame()
-        if not raw_bytes:
-            return None
-        return parse_standard_frame(raw_bytes)
+        return parse_standard_frame(raw_bytes) if raw_bytes else None
 
     def close(self):
-        """Cleanly close ports"""
-        if self.cli_com and self.cli_com.is_open:
-            self.cli_com.close()
-        if self.data_com and self.data_com.is_open:
-            self.data_com.close()
+        if self.cli_com and self.cli_com.is_open: self.cli_com.close()
+        if self.data_com and self.data_com.is_open: self.data_com.close()
 
     @staticmethod
     def find_ti_ports():
-        """Helper static method to find ports automatically"""
-        ports = list(list_ports.comports())
+        """Auto-detects active TI radar COM ports"""
         cli, data = None, None
-        for p in ports:
+        for p in list_ports.comports():
             if 'XDS110 Class Application/User UART' in p.description or 'Enhanced COM Port' in p.description:
                 cli = p.device
             elif 'XDS110 Class Auxiliary Data Port' in p.description or 'Standard COM Port' in p.description:

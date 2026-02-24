@@ -1,72 +1,69 @@
 import struct
-import math
 import logging
 import numpy as np
-from .math_utils import sphericalToCartesianPointCloud
 
 log = logging.getLogger(__name__)
 
-# --- TLV Defines ---
+# --- TLV (Type-Length-Value) Identifiers ---
 TLV_DETECTED_POINTS = 1
 TLV_RANGE_DOPPLER_HEAT_MAP = 5
 
+# Main Frame Header: 1 unsigned long long (magic word), 8 unsigned ints
+FRAME_HEADER_STRUCT = 'Q8I'
+FRAME_HEADER_LEN = struct.calcsize(FRAME_HEADER_STRUCT)
+TLV_HEADER_LEN = 8
+
 def parsePointCloudTLV(tlvData, tlvLength, outputDict):
-    # (Keep your existing point cloud parser here if you have it)
+    """Placeholder for future 3D point cloud parsing"""
     pass
 
 def parseDopplerTLV(tlvData, tlvLength, outputDict):
+    """Instantly maps byte buffer to uint16 numpy array for maximum speed"""
     try:
-        # SUPER FAST UNPACKING FIX: 
-        # Keeps as numpy array, uses .copy() instead of converting to Python list
-        rdhm = np.frombuffer(tlvData, dtype=np.uint16).copy()
-        outputDict['RDHM'] = rdhm
+        outputDict['RDHM'] = np.frombuffer(tlvData, dtype=np.uint16).copy()
     except Exception as e:
         log.error(f'RDHM TLV Parser Failed: {e}')
 
+# Route TLV types to their respective parser functions
 PARSER_FUNCTIONS = {
     TLV_DETECTED_POINTS: parsePointCloudTLV,
     TLV_RANGE_DOPPLER_HEAT_MAP: parseDopplerTLV
 }
 
 def parse_standard_frame(frameData):
-    """Parses raw byte array of a single frame into a dictionary"""
-    headerStruct = 'Q8I'
-    frameHeaderLen = struct.calcsize(headerStruct)
-    tlvHeaderLength = 8
-    
+    """Parses raw byte array of a single frame into a structured dictionary"""
     outputDict = {'error': 0, 'pointCloud': None, 'RDHM': None}
 
-    # Verify we even have enough bytes for the main header
-    if len(frameData) < frameHeaderLen:
+    if len(frameData) < FRAME_HEADER_LEN:
         outputDict['error'] = 1
         return outputDict
 
     try:
-        magic, version, totalPacketLen, platform, frameNum, timeCPUCycles, numDetectedObj, numTLVs, subFrameNum = struct.unpack(headerStruct, frameData[:frameHeaderLen])
-    except Exception as e:
+        header_data = struct.unpack(FRAME_HEADER_STRUCT, frameData[:FRAME_HEADER_LEN])
+        # Unpack indices: 4 is frameNum, 7 is numTLVs
+        outputDict['frameNum'] = header_data[4]
+        numTLVs = header_data[7]
+    except struct.error:
         outputDict['error'] = 1
         return outputDict
 
-    frameData = frameData[frameHeaderLen:]
-    outputDict['frameNum'] = frameNum
+    frameData = frameData[FRAME_HEADER_LEN:]
 
     for _ in range(numTLVs):
-        # CRITICAL FIX 1: Check if we have enough bytes for the TLV Header (8 bytes)
-        if len(frameData) < tlvHeaderLength:
+        # Ensure enough bytes exist for TLV header
+        if len(frameData) < TLV_HEADER_LEN:
             break
             
-        tlvType, tlvLength = struct.unpack('2I', frameData[:tlvHeaderLength])
-        frameData = frameData[tlvHeaderLength:]
+        tlvType, tlvLength = struct.unpack('2I', frameData[:TLV_HEADER_LEN])
+        frameData = frameData[TLV_HEADER_LEN:]
 
-        # CRITICAL FIX 2: Check if we have enough bytes for the TLV Payload
+        # Prevent buffer overflows if frame is truncated
         if len(frameData) < tlvLength:
-            break # Drop the rest of this corrupted frame safely
+            break 
 
-        # Parse valid TLV
         if tlvType in PARSER_FUNCTIONS:
             PARSER_FUNCTIONS[tlvType](frameData[:tlvLength], tlvLength, outputDict)
 
-        # Move to next TLV
         frameData = frameData[tlvLength:]
 
     return outputDict

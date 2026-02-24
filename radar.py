@@ -1,113 +1,86 @@
 import sys
-import os
 import time
-import datetime
-import traceback
+import json
 import numpy as np
 import pyqtgraph as pg
+import serial.tools.list_ports
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-# UI Imports
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 from PyQt6.QtWidgets import *
 
-# Radar Backend
 try:
-    from ti_radar import RadarSensor
+    from ti_radar.sensor import RadarSensor
     RADAR_LIB_AVAILABLE = True
 except ImportError:
     RADAR_LIB_AVAILABLE = False
 
-# ===================== USER CONFIG =====================
-CLI_PORT = "COM10"
-DATA_PORT = "COM11"
-CFG_FILE = "ti_radar/chirp_config/profile_3d_isk.cfg"
-MAX_RANGE_METERS = 5.0 
-# ======================================================
+CFG_FILE = "ti_radar/profile_3d_isk.cfg"
 
-WINDOW_WIDTH, WINDOW_HEIGHT = 1000, 600
-MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT = 800, 500
-TEXT_DIM = "#888888"
-VERSION = "v1.3.0-Pure-Heatmap"
-
+# --- Shared UI Constants ---
+WINDOW_WIDTH, WINDOW_HEIGHT = 1000, 750
 STYLESHEET = """
 QMainWindow { background-color: #1e1e1e; color: #ffffff; }
 QFrame#Sidebar { background-color: #252526; border-right: 1px solid #333; }
-QLabel { color: #e0e0e0; }
-QLineEdit { background-color: #3c3c3c; border: 1px solid #555; color: white; padding: 5px; border-radius: 3px; }
-QLineEdit:disabled { background-color: #2b2b2b; color: #888; }
-QComboBox { background-color: #3c3c3c; border: 1px solid #555; color: white; padding: 5px; border-radius: 3px; }
-QComboBox:disabled { background-color: #2b2b2b; color: #888; }
+QLabel { color: #e0e0e0; font-size: 11px; }
+QLineEdit, QDoubleSpinBox, QComboBox { background-color: #3c3c3c; border: 1px solid #555; color: white; padding: 4px; border-radius: 3px; }
+QLineEdit:disabled, QDoubleSpinBox:disabled, QComboBox:disabled { background-color: #2b2b2b; color: #888; }
 QPushButton { background-color: #0e639c; color: white; border: none; border-radius: 4px; font-weight: bold; }
 QPushButton:hover { background-color: #1177bb; }
+QPushButton:disabled { background-color: #333333; color: #666666; }
 QPushButton#RecBtn[recording="true"] { background-color: #d32f2f; }
-QPushButton#RecBtn[recording="true"]:hover { background-color: #f44336; }
 """
 
 class RadarWorker(QThread):
-    # Emits the full 2D matrix: (Range, Velocity)
     new_heatmap = pyqtSignal(np.ndarray)
     
-    def __init__(self, radar_sensor):
+    def __init__(self, radar_sensor, max_range_meters):
         super().__init__()
         self.radar = radar_sensor
         self.is_running = True
-        
-        # Recording state
         self.is_recording = False
-        self.recorded_session_rdhm = []
-        self.recorded_session_timestamps = []
         
-        # Matrix Dimensions
+        self.recorded_frames = []
+        self.recorded_timestamps = []
+        
         self.num_range_bins = self.radar.config.ADCsamples
         self.num_vel_bins = self.radar.config.numLoops
-
-        self.num_range_bins = self.radar.config.ADCsamples
-        self.num_vel_bins = self.radar.config.numLoops
-        
-        # Calculate exactly which row index equals MAX_RANGE_METERS
-        self.max_bin = min(int(MAX_RANGE_METERS / self.radar.config.rangeRes), self.num_range_bins)
+        self.max_bin = min(int(max_range_meters / self.radar.config.rangeRes), self.num_range_bins)
 
     def run(self):
         while self.is_running:
             try:
                 frame = self.radar.get_next_frame()
-                if not frame or frame.get("RDHM") is None: 
-                    continue
+                if not frame or frame.get("RDHM") is None: continue
                 
                 raw_rdhm = frame["RDHM"]
-                
                 if raw_rdhm.size == (self.num_range_bins * self.num_vel_bins):
-                    # 1. Reshape to 2D first
+                    # 1. Reshape and crop to desired max distance
                     rd_matrix = np.array(raw_rdhm, dtype=np.float32).reshape(self.num_range_bins, self.num_vel_bins)
-                    
-                    # 2. Crop the top off the matrix!
                     rd_matrix_cropped = rd_matrix[:self.max_bin, :]
                     
-                    # 3. Save the *cropped* raw data (Saves 50%+ RAM and disk space)
+                    # 2. Store pure physics data if recording
                     if self.is_recording:
-                        self.recorded_session_rdhm.append(np.copy(rd_matrix_cropped))
-                        self.recorded_session_timestamps.append(time.time())
+                        self.recorded_frames.append(np.copy(rd_matrix_cropped))
+                        self.recorded_timestamps.append(time.time())
 
-                    # 4. Process Data for UI Heatmap
-                    # Use the cropped matrix for the FFT shift and log conversion
+                    # 3. Prepare data for UI (Shift 0 velocity to center, convert to Log scale)
                     ui_matrix = np.fft.fftshift(rd_matrix_cropped, axes=1)
                     ui_matrix = 20 * np.log10(np.abs(ui_matrix) + 1e-6)
-                    
                     self.new_heatmap.emit(ui_matrix)
 
             except Exception as e:
                 print(f"Worker Error: {e}")
 
-
-    def start_recording(self):
-        self.recorded_session_rdhm = []
-        self.recorded_session_timestamps = []
-        self.is_recording = True
-
-    def stop_recording(self):
-        self.is_recording = False
-        return self.recorded_session_rdhm, self.recorded_session_timestamps
+    def toggle_recording(self, state):
+        self.is_recording = state
+        if state:
+            self.recorded_frames.clear()
+            self.recorded_timestamps.clear()
+        return self.recorded_frames, self.recorded_timestamps
 
     def stop(self):
         self.is_running = False
@@ -119,263 +92,265 @@ class RadarRecorderApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("OST Radar Recorder")
         self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
-        self.setMinimumSize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+        self.setStyleSheet(STYLESHEET)
         
         self.is_recording = False
         self.frame_count = 0
-        self.prev_time = 0
-        self.radar = None
+        self.prev_time = time.time()
         self.worker = None
         
-        self._init_ui()
-        self.setStyleSheet(STYLESHEET)
-        QTimer.singleShot(100, self.load_heavy_components)
+        self._build_ui()
+        self._auto_populate_ports()
 
-    def load_heavy_components(self):
-        try:
-            self.lbl_video.setText("Initializing Radar Sensor...")
-            QApplication.processEvents() 
-
-            if not RADAR_LIB_AVAILABLE:
-                raise Exception("ti_radar library not found in directory.")
-
-            if not self.connect_radar():
-                self.close()
-                return
-            
-            self.lbl_video.hide()
-            self.plot_widget.show()
-
-            # Calculate the exact physical range of the cropped bins
-            max_bin = min(int(MAX_RANGE_METERS / self.radar.config.rangeRes), self.radar.config.ADCsamples)
-            actual_max_range = max_bin * self.radar.config.rangeRes
-            
-            max_vel = (self.radar.config.numLoops / 2.0) * self.radar.config.dopRes
-            dop_res = self.radar.config.dopRes
-            
-            # Use actual_max_range for the bounding box height
-            self.rect = QRectF(-max_vel - (dop_res / 2.0), 0, max_vel * 2, actual_max_range)
-            self.image_item.setRect(self.rect)
-            
-            self.worker = RadarWorker(self.radar)
-            self.worker.new_heatmap.connect(self.update_loop)
-            self.worker.start()
-
-        except Exception as e:
-            traceback.print_exc()
-            QMessageBox.critical(self, "Startup Error", f"Failed to initialize:\n{e}")
-
-    def connect_radar(self):
-        while True:
-            try:
-                self.radar = RadarSensor(CLI_PORT, DATA_PORT, CFG_FILE)
-                self.radar.connect_and_configure()
-                return True
-            except Exception as e:
-                msg = QMessageBox(self)
-                msg.setIcon(QMessageBox.Icon.Critical)
-                msg.setWindowTitle("Radar Error")
-                msg.setText("Radar Sensor not detected.")
-                msg.setInformativeText(f"Error: {str(e)}\n\nPlease connect radar and retry.")
-                msg.setStandardButtons(QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Cancel)
-                if msg.exec() == QMessageBox.StandardButton.Cancel:
-                    return False
-
-    def _init_ui(self):
+    # ================= UI SETUP =================
+    def _build_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        
+        # Build Panels
+        main_layout.addWidget(self._create_sidebar())
+        main_layout.addWidget(self._create_video_area())
 
-        # SIDEBAR
-        self.sidebar = QFrame()
-        self.sidebar.setObjectName("Sidebar")
-        self.sidebar.setFixedWidth(220)
-        side_layout = QVBoxLayout(self.sidebar)
-        side_layout.setContentsMargins(15, 20, 15, 30)
-        side_layout.setSpacing(5)
+    def _create_sidebar(self):
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(260)
+        layout = QVBoxLayout(sidebar)
+        layout.setSpacing(6)
 
         title = QLabel("OST Radar Recorder")
         title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-        side_layout.addWidget(title)
-        side_layout.addSpacing(10)
+        layout.addWidget(title)
 
-        self.inp_subject = self._add_input(side_layout, "Subject ID *", "e.g. S01")
-        self.inp_activity = self._add_input(side_layout, "Activity *", "e.g. Running")
-        self.inp_temp = self._add_input(side_layout, "Room Temp (°C) *", "24.0")
+        # Connect Area
+        self.cmb_cli = QComboBox()
+        self.cmb_cli.setEditable(True)
+        self.cmb_data = QComboBox()
+        self.cmb_data.setEditable(True)
+        
+        self.btn_connect = QPushButton("Connect Radar")
+        self.btn_connect.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_connect.clicked.connect(self._handle_connection)
+        
+        layout.addWidget(QLabel("CLI Port"))
+        layout.addWidget(self.cmb_cli)
+        layout.addWidget(QLabel("DATA Port"))
+        layout.addWidget(self.cmb_data)
+        layout.addWidget(self.btn_connect)
+        layout.addWidget(QFrame(frameShape=QFrame.Shape.HLine, styleSheet="color: #444; margin: 5px 0;"))
 
-        side_layout.addWidget(QLabel("Date"))
-        self.lbl_date = QLabel(datetime.datetime.now().strftime("%Y-%m-%d"))
-        self.lbl_date.setStyleSheet("color: gray;")
-        side_layout.addWidget(self.lbl_date)
+        # Config Area
+        self.spin_max_range = QDoubleSpinBox()
+        self.spin_max_range.setValue(5.0)
+        self.spin_max_range.setSingleStep(0.5)
+        self.spin_max_range.setRange(1.0, 20.0)
+        
+        self.cmb_cmap = QComboBox()
+        self.cmb_cmap.addItems(['inferno', 'magma', 'viridis', 'plasma', 'turbo'])
+        self.cmb_cmap.currentTextChanged.connect(lambda c: self.image_item.setColorMap(pg.colormap.get(c)))
 
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("color: #444;")
-        side_layout.addWidget(line)
+        layout.addWidget(QLabel("Max Range Crop (Meters)"))
+        layout.addWidget(self.spin_max_range)
+        layout.addWidget(QLabel("Heatmap Color Map"))
+        layout.addWidget(self.cmb_cmap)
+        layout.addWidget(QFrame(frameShape=QFrame.Shape.HLine, styleSheet="color: #444; margin: 5px 0;"))
 
-        side_layout.addWidget(QLabel("Radar Config"))
-        self.cmb_model = QComboBox()
-        self.cmb_model.addItems([CFG_FILE.split('/')[-1]])
-        side_layout.addWidget(self.cmb_model)
+        # Metadata Area
+        self.inp_subject = QLineEdit()
+        self.inp_subject.setPlaceholderText("e.g. S01")
+        self.inp_activity = QLineEdit()
+        self.inp_activity.setPlaceholderText("e.g. Running")
+        self.inp_temp = QLineEdit()
+        self.inp_temp.setPlaceholderText("24.0")
+        
+        layout.addWidget(QLabel("Subject ID *")); layout.addWidget(self.inp_subject)
+        layout.addWidget(QLabel("Activity *")); layout.addWidget(self.inp_activity)
+        layout.addWidget(QLabel("Temp (°C) *")); layout.addWidget(self.inp_temp)
 
-        side_layout.addSpacing(10)
-        self.lbl_fps = QLabel("FPS: 00.0")
-        self.lbl_fps.setFont(QFont("Consolas", 12))
-        side_layout.addWidget(self.lbl_fps)
+        # Stats Area
+        self.lbl_fps = QLabel("FPS: 0.0")
+        self.lbl_fps.setFont(QFont("Consolas", 11))
         
         self.lbl_frames = QLabel("Frames: 0")
         self.lbl_frames.setFont(QFont("Consolas", 10))
         self.lbl_frames.setStyleSheet("color: gray;")
-        side_layout.addWidget(self.lbl_frames)
-
+        
         self.lbl_error = QLabel("")
         self.lbl_error.setStyleSheet("color: #ff5555; font-size: 10px;")
-        side_layout.addWidget(self.lbl_error)
+        
+        layout.addWidget(self.lbl_fps)
+        layout.addWidget(self.lbl_frames)
+        layout.addWidget(self.lbl_error)
+        layout.addStretch()
 
+        # Record Button
         self.btn_record = QPushButton("Record")
         self.btn_record.setObjectName("RecBtn")
+        self.btn_record.setEnabled(False)
         self.btn_record.setFixedHeight(40)
-        self.btn_record.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_record.clicked.connect(self.toggle_recording)
         self.btn_record.setProperty("recording", False)
-        side_layout.addWidget(self.btn_record)
+        self.btn_record.clicked.connect(self._toggle_recording)
+        layout.addWidget(self.btn_record)
 
-        l_ver = QLabel(VERSION)
-        l_ver.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px; border: none; margin-top: 15px;")
-        l_ver.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        side_layout.addWidget(l_ver)
+        return sidebar
 
-        main_layout.addWidget(self.sidebar)
-
-        # 2D HEATMAP AREA
-        self.video_container = QWidget()
-        self.video_container.setStyleSheet("background-color: black;")
-        video_layout = QVBoxLayout(self.video_container)
-        video_layout.setContentsMargins(0, 0, 0, 0)
+    def _create_video_area(self):
+        container = QWidget()
+        container.setStyleSheet("background-color: black;")
+        layout = QVBoxLayout(container)
         
-        self.lbl_video = QLabel("Initializing...")
+        self.lbl_video = QLabel("Radar Disconnected.")
         self.lbl_video.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        video_layout.addWidget(self.lbl_video)
+        layout.addWidget(self.lbl_video)
 
-        # PyQtGraph Image Setup
         pg.setConfigOptions(imageAxisOrder='row-major')
         self.plot_widget = pg.PlotWidget(title="Live Range-Doppler Heatmap")
-        self.plot_widget.setLabel('left', 'Range (Distance)', units='m')
-        self.plot_widget.setLabel('bottom', 'Velocity (Speed)', units='m/s')
+        self.plot_widget.setLabel('left', 'Range', units='m')
+        self.plot_widget.setLabel('bottom', 'Velocity', units='m/s')
         
-        # Add a center line to easily see 0 m/s (Stationary objects)
-        v_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('w', style=Qt.PenStyle.DashLine, alpha=100))
-        self.plot_widget.addItem(v_line)
+        self.plot_widget.addItem(pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('w', style=Qt.PenStyle.DashLine, alpha=100)))
         
         self.image_item = pg.ImageItem()
         self.image_item.setColorMap(pg.colormap.get('inferno'))
         self.plot_widget.addItem(self.image_item)
         self.plot_widget.hide() 
+        layout.addWidget(self.plot_widget)
+        
+        return container
+    # ================= LOGIC =================
+    def _auto_populate_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.cmb_cli.addItems(ports); self.cmb_data.addItems(ports)
+        if RADAR_LIB_AVAILABLE:
+            cli, data = RadarSensor.find_ti_ports()
+            if cli: self.cmb_cli.setCurrentText(cli)
+            if data: self.cmb_data.setCurrentText(data)
 
-        video_layout.addWidget(self.plot_widget)
-        main_layout.addWidget(self.video_container)
+    def _handle_connection(self):
+        cli, data = self.cmb_cli.currentText().strip(), self.cmb_data.currentText().strip()
+        if not cli or not data: return self.lbl_error.setText("⚠ Select valid ports.")
 
-    def _add_input(self, layout, label, placeholder):
-        layout.addWidget(QLabel(label))
-        inp = QLineEdit()
-        inp.setPlaceholderText(placeholder)
-        layout.addWidget(inp)
-        return inp
+        self.btn_connect.setEnabled(False)
+        self.lbl_video.setText("Initializing...")
+        QApplication.processEvents() 
 
-    def toggle_recording(self):
-        if not self.worker: return 
-
-        # FIX: Grab the text values at the very beginning of the function
-        s = self.inp_subject.text().strip()
-        a = self.inp_activity.text().strip()
-        t = self.inp_temp.text().strip()
-
-        if not self.is_recording:
-            if not all([s, a, t]):
-                self.lbl_error.setText("⚠ MISSING FIELDS")
-                return
+        try:
+            radar = RadarSensor(cli, data, CFG_FILE)
+            radar.connect_and_configure()
+            
+            # Lock hardware UI state
+            for w in [self.cmb_cli, self.cmb_data, self.spin_max_range]: w.setEnabled(False)
+            self.btn_connect.setText("Connected")
+            self.btn_connect.setStyleSheet("background-color: #2e7d32; color: white;")
+            self.btn_record.setEnabled(True)
             self.lbl_error.setText("")
             
-            self.is_recording = True
-            self.frame_count = 0
-            self.worker.start_recording()
-            self._set_inputs_enabled(False)
-            
-            self.btn_record.setText("STOP")
-            self.btn_record.setProperty("recording", True)
-            self.btn_record.style().unpolish(self.btn_record)
-            self.btn_record.style().polish(self.btn_record)
-            
-            self.plot_widget.setTitle("<span style='color: red;'>RECORDING IN PROGRESS...</span>")
-            
-        else:
-            self.is_recording = False
-            rdhm_data, timestamps = self.worker.stop_recording()
-            
-            self._set_inputs_enabled(True)
-            self.lbl_frames.setStyleSheet("color: gray;")
-            self.btn_record.setText("RECORD")
-            self.btn_record.setProperty("recording", False)
-            self.btn_record.style().unpolish(self.btn_record)
-            self.btn_record.style().polish(self.btn_record)
-            self.plot_widget.setTitle("Live Range-Doppler Heatmap")
-            
-            if len(rdhm_data) > 0:
-                # s, a, and t are now safely accessible here!
-                filename = f"radar_{s}_{a}_{int(time.time())}.npz"
-                np.savez_compressed(
-                    filename,
-                    rdhm=np.array(rdhm_data), 
-                    timestamps=np.array(timestamps),
-                    metadata={
-                        "subject": s, 
-                        "activity": a, 
-                        "temp": t,
-                        "range_res": self.radar.config.rangeRes,
-                        "doppler_res": self.radar.config.dopRes,
-                        "dop_max": self.radar.config.dopMax
-                    }
-                )
-                self.lbl_error.setStyleSheet("color: #4CAF50;")
-                self.lbl_error.setText(f"Saved: {filename}")
-    def _set_inputs_enabled(self, enabled):
-        for w in [self.inp_subject, self.inp_activity, self.inp_temp, self.cmb_model]:
-            w.setEnabled(enabled)
+            self._start_worker(radar)
 
-    def update_loop(self, heatmap_matrix):
-        # Calculate FPS
-        t = time.time()
-        dt = t - self.prev_time
-        fps = 1.0 / dt if dt > 0 else 0
-        self.prev_time = t
-        self.lbl_fps.setText(f"FPS: {fps:.1f}")
+        except Exception as e:
+            self.btn_connect.setEnabled(True)
+            QMessageBox.critical(self, "Connection Error", str(e))
 
-        # Set the single 2D frame
-        self.image_item.setImage(heatmap_matrix, autoLevels=False)
+    def _start_worker(self, radar):
+        max_m = self.spin_max_range.value()
+        max_bin = min(int(max_m / radar.config.rangeRes), radar.config.ADCsamples)
+        actual_max_range = max_bin * radar.config.rangeRes
         
-        # Fix: Reapply bounding box
-        if hasattr(self, 'rect'):
-            self.image_item.setRect(self.rect)
+        max_v = (radar.config.numLoops / 2.0) * radar.config.dopRes
+        dop_res = radar.config.dopRes
         
-        # Dynamic contrast: Hide the bottom 40% noise so moving feet pop out
-        vmin = np.percentile(heatmap_matrix, 40)
-        vmax = np.percentile(heatmap_matrix, 99.5)
-        self.image_item.setLevels((vmin, vmax))
+        # Center bounding box
+        self.rect = QRectF(-max_v - (dop_res / 2.0), 0, max_v * 2, actual_max_range)
+        self.image_item.setRect(self.rect)
+        
+        self.lbl_video.hide()
+        self.plot_widget.show()
+        
+        self.worker = RadarWorker(radar, max_m)
+        self.worker.new_heatmap.connect(self._on_new_frame)
+        self.worker.start()
+
+    def _on_new_frame(self, matrix):
+        # Update FPS safely
+        now = time.time()
+        self.lbl_fps.setText(f"FPS: {1.0 / (now - self.prev_time):.1f}" if now > self.prev_time else "FPS: 0.0")
+        self.prev_time = now
+
+        # Update Visuals
+        self.image_item.setImage(matrix, autoLevels=False)
+        self.image_item.setRect(self.rect) 
+        self.image_item.setLevels((np.percentile(matrix, 40), np.percentile(matrix, 99.5)))
 
         if self.is_recording:
             self.frame_count += 1
             self.lbl_frames.setText(f"Frames: {self.frame_count}")
             self.lbl_frames.setStyleSheet("color: #ff5555; font-weight: bold;")
 
+    def _toggle_recording(self):
+        s, a, t = self.inp_subject.text().strip(), self.inp_activity.text().strip(), self.inp_temp.text().strip()
+        
+        if not self.is_recording:
+            if not all([s, a, t]): return self.lbl_error.setText("⚠ MISSING FIELDS")
+            
+            self.is_recording = True
+            self.frame_count = 0
+            self.worker.toggle_recording(True)
+            
+            for w in [self.inp_subject, self.inp_activity, self.inp_temp]: w.setEnabled(False)
+            self._update_btn_style(True, "STOP")
+            
+        else:
+            self.is_recording = False
+            frames, timestamps = self.worker.toggle_recording(False)
+            
+            for w in [self.inp_subject, self.inp_activity, self.inp_temp]: w.setEnabled(True)
+            self._update_btn_style(False, "RECORD")
+            self.lbl_frames.setStyleSheet("color: gray;")
+            
+            if frames: self._save_to_parquet(s, a, t, frames, timestamps)
+
+    def _update_btn_style(self, is_rec, text):
+        self.btn_record.setText(text)
+        self.btn_record.setProperty("recording", is_rec)
+        self.btn_record.style().unpolish(self.btn_record)
+        self.btn_record.style().polish(self.btn_record)
+
+    def _save_to_parquet(self, subject, activity, temp, frames, timestamps):
+        """Migrated from .npz to Apache Parquet for high-performance columnar storage"""
+        filename = f"radar_{subject}_{activity}_{int(time.time())}.parquet"
+        
+        # Serialize metadata and frame dimensions directly into the Parquet schema
+        metadata = {
+            "subject": subject, "activity": activity, "temp": temp,
+            "range_res": self.worker.radar.config.rangeRes,
+            "doppler_res": self.worker.radar.config.dopRes,
+            "dop_max": self.worker.radar.config.dopMax
+        }
+        
+        # Flattens raw physics arrays into bytes for columnar storage
+        df = pd.DataFrame({
+            "timestamp": timestamps,
+            "frame_data": [f.tobytes() for f in frames]
+        })
+        
+        table = pa.Table.from_pandas(df)
+        custom_schema = {
+            b"radar_metadata": json.dumps(metadata).encode(),
+            b"frame_shape": json.dumps(frames[0].shape).encode(),
+            b"frame_dtype": str(frames[0].dtype).encode()
+        }
+        
+        table = table.replace_schema_metadata({**(table.schema.metadata or {}), **custom_schema})
+        pq.write_table(table, filename)
+        
+        self.lbl_error.setStyleSheet("color: #4CAF50;")
+        self.lbl_error.setText(f"Saved: {filename}")
+
     def closeEvent(self, event):
-        if hasattr(self, 'worker') and self.worker is not None:
-            self.worker.stop()
-        if hasattr(self, 'radar') and self.radar is not None:
-            try:
-                self.radar.close()
-            except: pass
+        if self.worker: self.worker.stop()
+        if self.worker and self.worker.radar: self.worker.radar.close()
         event.accept()
 
 if __name__ == "__main__":
