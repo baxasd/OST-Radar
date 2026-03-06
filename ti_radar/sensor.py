@@ -1,116 +1,117 @@
-import serial
-from serial.tools import list_ports
 import time
 import logging
+import serial
+from serial.tools import list_ports
+
 from ti_radar.config import RadarConfig
 from ti_radar.parser import parse_standard_frame
 
 log = logging.getLogger(__name__)
 
+# TI IWR/AWR magic word — marks the start of every data frame
+_MAGIC = bytearray(b"\x02\x01\x04\x03\x06\x05\x08\x07")
+_MAGIC_LEN = len(_MAGIC)
+
+
 class RadarSensor:
-    # 8-byte sequence marking the absolute start of a new data frame
-    UART_MAGIC_WORD = bytearray(b'\x02\x01\x04\x03\x06\x05\x08\x07')
 
-    def __init__(self, cli_port, data_port, config_file):
-        self.config = RadarConfig(config_file)
-        self.cli_port_name = cli_port
-        self.data_port_name = data_port
-        self.cli_com = None
-        self.data_com = None
+    def __init__(self, cli_port: str, data_port: str, config_file: str):
+        self.config         = RadarConfig(config_file)
+        self._cli_port_name = cli_port
+        self._data_port_name= data_port
+        self._cli           = None
+        self._data          = None
 
+    # ── connection ────────────────────────────────────────────────────────
     def connect_and_configure(self):
-        """Opens serial ports and flashes the CFG profile to the radar's DSP"""
-        self.cli_com = serial.Serial(self.cli_port_name, 115200, timeout=0.6)
-        self.data_com = serial.Serial(self.data_port_name, 921600, timeout=0.6)
-        self.data_com.reset_output_buffer()
-        
+        """Opens serial ports and flashes the profile to the radar DSP."""
+        self._cli  = serial.Serial(self._cli_port_name,  115200, timeout=0.6)
+        self._data = serial.Serial(self._data_port_name, 921600, timeout=0.6)
+        self._data.reset_output_buffer()
         self._send_cfg()
-        self.config.print_summary()
 
     def _send_cfg(self):
-        """Sends commands line-by-line via the CLI port"""
-        with open(self.config.file_path, "r") as f:
-            lines = [line.strip() for line in f if line.strip() and not line.startswith('%')]
+        """Streams config commands line-by-line over the CLI port."""
+        with open(self.config.file_path) as f:
+            lines = [l.strip() for l in f if l.strip() and not l.startswith("%")]
 
         for line in lines:
             time.sleep(0.03)
-            self.cli_com.write((line + '\n').encode())
-            
-            # Flush acks from hardware
-            self.cli_com.readline()
-            self.cli_com.readline()
+            self._cli.write((line + "\n").encode())
+            self._cli.readline()   # ack line 1
+            self._cli.readline()   # ack line 2
+            # FIX: removed dead 'baudRate' branch — that command does not exist
+            # in standard TI mmWave profiles and was never reachable.
 
-            if line.startswith("baudRate"):
-                self.cli_com.baudrate = int(line.split()[1])
-                
         time.sleep(0.03)
-        self.cli_com.reset_input_buffer()
+        self._cli.reset_input_buffer()
 
-    def read_raw_frame(self):
-        """Scans the UART stream until it locks onto a Magic Word, then reads exactly one frame."""
-        index = 0
-        frameData = bytearray()
-        
-        # 1. Hunt for the magic word to sync with the hardware stream
+    # ── frame acquisition ─────────────────────────────────────────────────
+    def read_raw_frame(self) -> bytes | None:
+        """Syncs to the magic word and reads exactly one complete frame."""
+        idx  = 0
+        buf  = bytearray()
+
+        # Phase 1: hunt for the 8-byte magic word
         while True:
-            magicByte = self.data_com.read(1)
-            if not magicByte:
-                return None 
-
-            if magicByte[0] == self.UART_MAGIC_WORD[index]:
-                index += 1
-                frameData.append(magicByte[0])
-                if index == len(self.UART_MAGIC_WORD):
+            b = self._data.read(1)
+            if not b:
+                return None
+            byte = b[0]
+            if byte == _MAGIC[idx]:
+                buf.append(byte)
+                idx += 1
+                if idx == _MAGIC_LEN:
                     break
             else:
-                # Mismatch found. Reset search, but check if this mismatched byte 
-                # is actually the start of a brand new sequence to prevent dropped frames.
-                index = 1 if magicByte[0] == self.UART_MAGIC_WORD[0] else 0
-                frameData = bytearray([magicByte[0]]) if index == 1 else bytearray()
+                # On mismatch, check if this byte restarts the sequence
+                if byte == _MAGIC[0]:
+                    buf = bytearray([byte])
+                    idx = 1
+                else:
+                    buf.clear()
+                    idx = 0
 
-        # 2. Extract frame length
-        versionBytes = self.data_com.read(4)
-        lengthBytes = self.data_com.read(4)
-        
-        if len(versionBytes) < 4 or len(lengthBytes) < 4:
-            return None 
-            
-        frameData.extend(versionBytes)
-        frameData.extend(lengthBytes)
-        
-        frameLength = int.from_bytes(lengthBytes, byteorder='little')
-        
-        # 3. Size sanity check (reject corrupt packets)
-        if not (16 <= frameLength <= 100000):
+        # Phase 2: read version (4 bytes) + length (4 bytes)
+        extra = self._data.read(8)
+        if len(extra) < 8:
             return None
-            
-        # 4. Pull the exact payload size to ensure we don't bleed into the next frame
-        bytes_to_read = frameLength - 16 
-        while bytes_to_read > 0:
-            chunk = self.data_com.read(bytes_to_read)
-            if not chunk: 
+        buf.extend(extra)
+
+        frame_len = int.from_bytes(extra[4:8], byteorder="little")
+        if not (16 <= frame_len <= 100_000):
+            return None  # reject corrupt/oversized packets
+
+        # Phase 3: read remainder of frame without bleeding into the next
+        remaining = frame_len - 16
+        while remaining > 0:
+            chunk = self._data.read(remaining)
+            if not chunk:
                 return None
-            frameData.extend(chunk)
-            bytes_to_read -= len(chunk)
-            
-        return frameData
+            buf.extend(chunk)
+            remaining -= len(chunk)
 
-    def get_next_frame(self):
-        """Fetches and parses a single frame dictionary"""
-        raw_bytes = self.read_raw_frame()
-        return parse_standard_frame(raw_bytes) if raw_bytes else None
+        return bytes(buf)
 
+    def get_next_frame(self) -> dict | None:
+        raw = self.read_raw_frame()
+        return parse_standard_frame(raw) if raw else None
+
+    # ── cleanup ───────────────────────────────────────────────────────────
     def close(self):
-        if self.cli_com and self.cli_com.is_open: self.cli_com.close()
-        if self.data_com and self.data_com.is_open: self.data_com.close()
+        for port in (self._cli, self._data):
+            if port and port.is_open:
+                port.close()
 
+    # ── port detection ────────────────────────────────────────────────────
     @staticmethod
-    def find_ti_ports():
-        """Auto-detects active TI radar COM ports"""
-        cli, data = None, None
+    def find_ti_ports() -> tuple[str | None, str | None]:
+        """Auto-detects TI XDS110 CLI and data ports by USB descriptor."""
+        cli = data = None
         for p in list_ports.comports():
-            if 'XDS110 Class Application/User UART' in p.description or 'Enhanced COM Port' in p.description:
+            desc = p.description
+            if "XDS110 Class Application/User UART" in desc or "Enhanced COM Port" in desc:
                 cli = p.device
-            elif 'XDS110 Class Auxiliary Data Port' in p.description or 'Standard COM Port' in p.description:
+            elif "XDS110 Class Auxiliary Data Port" in desc or "Standard COM Port" in desc:
                 data = p.device
         return cli, data

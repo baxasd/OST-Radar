@@ -3,71 +3,85 @@ import logging
 log = logging.getLogger(__name__)
 
 class RadarConfig:
-    """Parses TI mmWave configuration files and calculates physical radar parameters."""
-    
+    """Parses TI mmWave .cfg files and derives physical radar parameters."""
+
     def __init__(self, file_path):
         self.file_path = file_path
-        self._parse_file(file_path)
+        self._parse(file_path)
 
-    def _parse_file(self, file_path):
-        with open(file_path, "r") as f:
-            lines = [l for l in f if not l.startswith("%") and not l.startswith("\n")]
+    def _parse(self, file_path):
+        with open(file_path) as f:
+            lines = [l.split() for l in f if l.strip() and not l.startswith("%")]
 
-        antennas = {'txAntennas': 0, 'rxAntenna': 0}
-        self.chirpProf = {}
-        self.frameCfg = {}
+        chirp, frame, rx_en, tx_en = {}, {}, 0, 0
 
-        # Extract raw configuration values
-        for l in lines:
-            val = l.split()
-            if not val: continue
-            
+        for val in lines:
+            if not val:
+                continue
             if val[0] == "channelCfg":
-                antennas.update({'txAntennas': int(val[1]), 'rxAntenna': int(val[2])})
+                # FIX: TI doc order is <rxChannelEn> <txChannelEn>
+                # Previous code had these swapped — txAntennas/rxAntennas labels
+                # were wrong even though Nv (their product) was unaffected.
+                rx_en = int(val[1])
+                tx_en = int(val[2])
             elif val[0] == "profileCfg":
-                self.chirpProf.update({
-                    'startFreq': float(val[2]), 'idleTime': float(val[3]), 
-                    'adcStartTime': float(val[4]), 'rampEndTime': float(val[5]), 
-                    'freqSlope': float(val[8]), 'numADCsamples': int(val[10]),
-                    'sampleRate': float(val[11])
-                })
+                chirp = {
+                    "startFreq":    float(val[2]),   # GHz
+                    "idleTime":     float(val[3]),   # us
+                    "rampEndTime":  float(val[5]),   # us
+                    "freqSlope":    float(val[8]),   # MHz/us
+                    "numADCsamples":  int(val[10]),
+                    "sampleRate":   float(val[11]),  # ksps
+                }
             elif val[0] == "frameCfg":
-                self.frameCfg.update({
-                    'chirpStartInd': int(val[1]), 'chirpEndInd': int(val[2]),
-                    'numLoops': int(val[3]), 'periodicity': int(val[5])
-                })
+                frame = {
+                    "chirpStartInd": int(val[1]),
+                    "chirpEndInd":   int(val[2]),
+                    "numLoops":      int(val[3]),
+                    "periodicity":   int(val[5]),    # ms
+                }
 
-        # --- Radar Physics Calculations ---
-        # Count active antennas by counting the '1' bits in the binary representation
-        self.txAntennas = bin(antennas['txAntennas']).count("1")
-        self.rxAntennas = bin(antennas['rxAntenna']).count("1")
-        self.Nv = self.txAntennas * self.rxAntennas
+        # Antenna counts (popcount of enable bitmasks)
+        self.rxAntennas = bin(rx_en).count("1")
+        self.txAntennas = bin(tx_en).count("1")
+        self.Nv         = self.txAntennas * self.rxAntennas
 
-        # Bandwidth (BW) = Slope * (Samples / Sample Rate)
-        self.BW = self.chirpProf['freqSlope'] * self.chirpProf['numADCsamples'] / self.chirpProf['sampleRate'] * 1e9
-        
-        # Range Resolution = Speed of Light / (2 * Bandwidth)
-        self.rangeRes = 3e8 / (2 * self.BW)
-        self.rangeMax = self.rangeRes * (self.chirpProf['numADCsamples'] - 1)
+        # Bandwidth: slope [MHz/us] * sweep_time [us] -> MHz, then -> Hz
+        # sweep_time [us] = numADCsamples / sampleRate [ksps] * 1e3
+        self.ADCsamples = chirp["numADCsamples"]
+        self.BW = chirp["freqSlope"] * self.ADCsamples / chirp["sampleRate"] * 1e9  # Hz
 
-        # Doppler (Velocity) Calculations
-        self.numChirps = (self.frameCfg['chirpEndInd'] - self.frameCfg['chirpStartInd'] + 1) * self.frameCfg['numLoops']
-        
-        # Doppler Resolution = Speed of Light / (2 * Start Frequency * Frame Time)
-        total_chirp_time = (self.chirpProf['idleTime'] + self.chirpProf['rampEndTime']) * 1e-6
-        self.dopRes = 3e8 / (2 * self.chirpProf['startFreq'] * 1e9 * total_chirp_time * self.numChirps)
-        
-        self.numLoops = self.frameCfg['numLoops']
-        self.dopMax = self.numLoops * self.dopRes / 2 
-        self.T = self.frameCfg['periodicity']
-        self.ADCsamples = self.chirpProf['numADCsamples']
+        # Range
+        self.rangeRes = 3e8 / (2 * self.BW)            # m
+        self.rangeMax = self.rangeRes * self.ADCsamples  # FIX: N bins, not N-1
 
-    def print_summary(self):
-        print("\n========== Radar Configuration Summary ==========")
-        print(f"Frame periodicity : {self.T:.2f} ms ({1e3/self.T:.2f} Hz)")
-        print(f"Effective BW      : {(self.BW*1e-9):.2f} GHz")
-        print(f"Range Resolution  : {self.rangeRes*100:.2f} cm")
-        print(f"Maximum range     : {self.rangeMax:.2f} m")
-        print(f"Doppler Resolution: {self.dopRes:.2f} m/s")
-        print(f"Maximum velocity  : {self.dopMax:.2f} m/s")
-        print("=================================================\n")
+        # Doppler
+        # Total chirps per frame = chirps_per_loop * numLoops
+        chirps_per_loop  = frame["chirpEndInd"] - frame["chirpStartInd"] + 1
+        self.numLoops    = frame["numLoops"]
+        numChirps        = chirps_per_loop * self.numLoops
+
+        # Tc = time per chirp (idleTime + rampEndTime) in seconds
+        Tc           = (chirp["idleTime"] + chirp["rampEndTime"]) * 1e-6
+        fc           = chirp["startFreq"] * 1e9  # Hz
+
+        # For TDM MIMO the effective slow-time PRI is chirps_per_loop * Tc
+        # dopRes  = c / (2 * fc * Tc * numChirps)  [equivalent formulation]
+        # dopMax  = c / (4 * fc * chirps_per_loop * Tc)
+        self.dopRes  = 3e8 / (2 * fc * Tc * numChirps)
+        self.dopMax  = self.numLoops * self.dopRes / 2
+
+        # Frame timing
+        self.T = frame["periodicity"]  # ms
+
+    def summary(self) -> dict:
+        """Returns key parameters as a plain dict for external display."""
+        return {
+            "TX / RX antennas":  f"{self.txAntennas} / {self.rxAntennas}",
+            "Bandwidth":         f"{self.BW / 1e9:.3f} GHz",
+            "Range resolution":  f"{self.rangeRes * 100:.2f} cm",
+            "Range max":         f"{self.rangeMax:.2f} m",
+            "Doppler resolution":f"{self.dopRes:.3f} m/s",
+            "Max velocity":      f"±{self.dopMax:.2f} m/s",
+            "Frame rate":        f"{1e3 / self.T:.1f} Hz ({self.T:.0f} ms)",
+        }
