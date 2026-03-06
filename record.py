@@ -45,8 +45,8 @@ TEMP     = 24.0         # °C
 # ─────────────────────────────────────────────
 CFG_FILE  = "ti_radar/profile_3d_ISK.cfg"
 MAX_RANGE = 5.0         # metres — crop beyond this distance
-CLI_PORT  = None        # e.g. "COM3"  — None = auto-detect
-DATA_PORT = None        # e.g. "COM4"  — None = auto-detect
+CLI_PORT  = "/dev/ttyUSB0"        # e.g. "COM3"  — None = auto-detect
+DATA_PORT = "/dev/ttyUSB1"        # e.g. "COM4"  — None = auto-detect
 
 # ─────────────────────────────────────────────
 #  DISPLAY SETTINGS
