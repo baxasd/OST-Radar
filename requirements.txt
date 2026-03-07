@@ -1,0 +1,7 @@
+numpy
+pyarrow
+pyqtgraph
+PyQt6
+rich
+scipy
+pyserial
