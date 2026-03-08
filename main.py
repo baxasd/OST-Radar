@@ -10,10 +10,6 @@ from PyQt6.QtWidgets import QApplication, QMainWindow  # QApplication = the Qt e
 
 from core.radar import RadarSensor   # hardware abstraction — serial ports, framing, config
 
-from rich.console import Console   # pretty terminal output with colour
-from rich.table   import Table     # formatted table for the startup config summary
-from rich         import box       # box styles for the rich Table
-
 log = logging.getLogger(__name__)   # module-level logger, name = "viewer"
 
 # ─────────────────────────────────────────────
@@ -22,15 +18,13 @@ log = logging.getLogger(__name__)   # module-level logger, name = "viewer"
 CFG_FILE  = "core/config.cfg"   # path to the TI mmWave config file relative to this script
 MAX_RANGE = 5.0                 # clip the range (Y) axis to this many metres — saves vertical space
 
-CLI_PORT  = None    # set to e.g. "/dev/ttyACM0" or "COM3" to skip auto-detection
-DATA_PORT = None    # set to e.g. "/dev/ttyACM1" or "COM4" to skip auto-detection
+CLI_PORT  = None                # set to e.g. "/dev/ttyACM0" or "COM3" to skip auto-detection
+DATA_PORT = None                # set to e.g. "/dev/ttyACM1" or "COM4" to skip auto-detection
 
-CMAP             = "inferno"   # pyqtgraph colormap name — "inferno" is perceptually uniform and good for radar
-DISPLAY_LOW_PCT  = 40          # dB values below this percentile are mapped to the bottom of the colour scale
+CMAP             = "inferno"    # pyqtgraph colormap name — "inferno" is perceptually uniform and good for radar
+DISPLAY_LOW_PCT  = 40           # dB values below this percentile are mapped to the bottom of the colour scale
 DISPLAY_HIGH_PCT = 99.5        # dB values above this percentile are clipped to the top — suppresses rare hot pixels
 SMOOTH_GRID_SIZE = 250         # bilinear zoom target: output image will be at least 250×250 pixels
-
-console = Console()   # rich console used for the startup table and error messages
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -252,22 +246,22 @@ def connect_radar() -> RadarSensor:
     cli, data = CLI_PORT, DATA_PORT   # start with whatever the user set manually (may be None)
 
     if cli is None or data is None:
-        console.print("[yellow]Auto-detecting ports...[/yellow]")
+        print("Auto-detecting ports...")
         found_cli, found_data = RadarSensor.find_ti_ports()   # scan USB ports for TI device
         cli  = cli  or found_cli    # use manual value if set, otherwise use auto-detected
         data = data or found_data
 
     if not cli or not data:
         # Still None after auto-detection — print a helpful message and exit
-        console.print(
-            "[bold red]ERROR:[/bold red] Ports not found.\n"
+        print(
+            "ERROR: Ports not found.\n"
             "Set CLI_PORT / DATA_PORT manually at the top of viewer.py.\n"
             "Linux:   /dev/ttyACM0, /dev/ttyACM1\n"
             "Windows: COM3, COM4"
         )
         sys.exit(1)
 
-    console.print(f"CLI: [cyan]{cli}[/cyan]  DATA: [cyan]{data}[/cyan]")
+    print(f"CLI: {cli}  DATA: {data}")
     radar = RadarSensor(cli, data, CFG_FILE)   # create the sensor object (parses config, doesn't open ports yet)
     radar.connect_and_configure()              # open serial ports and send the .cfg to the hardware
     return radar
@@ -275,13 +269,11 @@ def connect_radar() -> RadarSensor:
 
 def print_radar_info(radar: RadarSensor):
     # Print a formatted table to the terminal showing the derived radar parameters
-    t = Table(title="Radar Config", box=box.ROUNDED, show_header=False)
-    t.add_column("", style="dim")        # parameter name column
-    t.add_column("", style="cyan bold")  # value column
-    t.add_row("Max Range", f"{MAX_RANGE} m")   # show the user-configured clipping distance
+    print("--- Radar Config ---")
+    print(f"{'Max Range':<20}: {MAX_RANGE} m")   # show the user-configured clipping distance
     for k, v in radar.config.summary().items():
-        t.add_row(k, str(v))   # add each derived parameter from RadarConfig.summary()
-    console.print(t)
+        print(f"{k:<20}: {str(v)}")   # add each derived parameter from RadarConfig.summary()
+    print("--------------------")
 
 
 def main():

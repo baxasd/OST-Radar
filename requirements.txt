@@ -5,3 +5,4 @@ PyQt6
 rich
 scipy
 pyserial
+zmq
