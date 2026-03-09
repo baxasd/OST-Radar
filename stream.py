@@ -10,7 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from core.radar import RadarSensor
-from core.base import parse_standard_frame
+from core.base import parse_standard_frame, VERSION  # [cite: 2]
 
 # Configure the logger to show timestamps and clean messages
 logging.basicConfig(
@@ -166,7 +166,7 @@ def main():
     socket.bind("tcp://*:5555")
     
     print("=========================================")
-    print("                OST RADAR       ")
+    print(f"                OST RADAR v{VERSION}       ")
     print("        ZMQ Bound to tcp://*:5555        ")
     print("=========================================")
 

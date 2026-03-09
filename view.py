@@ -9,7 +9,7 @@ import pyqtgraph as pg
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtWidgets import QApplication, QMainWindow
 
-from core.base import RadarConfig  # [cite: 2]
+from core.base import RadarConfig, VERSION  # [cite: 2]
 
 # Configure the logger to match the publisher's clean aesthetic
 logging.basicConfig(
@@ -121,7 +121,7 @@ class ViewerWindow(QMainWindow):
         self._precompute_zoom()
         self._start_worker()
         
-        self.setWindowTitle(f"OST Radar Subscriber [{self.publisher_ip}]")
+        self.setWindowTitle(f"OST Radar | v{VERSION} | IP: {self.publisher_ip}")
 
     def _build_plot(self):
         max_bin = min(int(MAX_RANGE / self.cfg.rangeRes), self.cfg.numRangeBins)

@@ -6,6 +6,7 @@ import numpy as np  # numpy for the uint16 frombuffer call in the parser
 
 log = logging.getLogger(__name__)  # module-level logger, name = "core"
 
+VERSION = "0.1.0"  # Semantic versioning: MAJOR.MINOR.PATCH
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  RadarConfig

@@ -1,0 +1,5 @@
+### v0.1.0
+- Stable ZeroMQ implementation with streamer and viewer over tcp
+- Image Scaling with ndImage
+- Decoupled visualization and Disk writing for performance
+- Calibrated config for TI Radar IWR6843ISK
