@@ -8,26 +8,33 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import configparser
 
 from core.radar import RadarSensor
-from core.base import parse_standard_frame, VERSION  # [cite: 2]
+from core.base import parse_standard_frame, VERSION
 
-# Configure the logger to show timestamps and clean messages
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("Publisher")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  RadarSessionWriter — Simplified for Date/Time only
+#  Load Global Settings
+# ─────────────────────────────────────────────────────────────────────────────
+config = configparser.ConfigParser()
+config.read('settings.ini')
+
+HW_CFG_FILE = config['Hardware']['radar_cfg_file']
+HW_CLI_PORT = config['Hardware']['cli_port']
+HW_DATA_PORT = config['Hardware']['data_port']
+ZMQ_PORT = config['Network']['zmq_port']
+CHUNK_SIZE = int(config['Recording']['chunk_size'])
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RadarSessionWriter
 # ─────────────────────────────────────────────────────────────────────────────
 class RadarSessionWriter:
     def __init__(self, metadata=None):
         os.makedirs("records", exist_ok=True)
         
-        # Generate the date/time string for the filename
         self.start_time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.filepath = f"records/session_{self.start_time_str}.parquet"
         
@@ -35,16 +42,13 @@ class RadarSessionWriter:
         self.metadata["session_start"] = self.start_time_str
         
         self.data_buffer = []
-        self.chunk_size = 100
+        self.chunk_size = CHUNK_SIZE
         self.writer = None
         self.total_frames = 0
         self.schema_columns = ['timestamp', 'rdhm_bytes']
 
     def write_frame(self, rdhm_array: np.ndarray):
-        self.data_buffer.append({
-            'timestamp': time.time(),
-            'rdhm_bytes': rdhm_array.tobytes()
-        })
+        self.data_buffer.append({'timestamp': time.time(), 'rdhm_bytes': rdhm_array.tobytes()})
         self.total_frames += 1
         
         if len(self.data_buffer) >= self.chunk_size:
@@ -58,9 +62,7 @@ class RadarSessionWriter:
         table = pa.Table.from_pandas(df)
         
         if self.writer is None:
-            schema_with_meta = table.schema.with_metadata({
-                b"session_meta": str(self.metadata).encode()
-            })
+            schema_with_meta = table.schema.with_metadata({b"session_meta": str(self.metadata).encode()})
             table = table.cast(schema_with_meta)
             self.writer = pq.ParquetWriter(self.filepath, schema_with_meta)
             
@@ -73,25 +75,28 @@ class RadarSessionWriter:
             self.writer.close()
             log.info(f"Session saved successfully: {self.filepath} ({self.total_frames} frames)")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Hardware Connection Helper
 # ─────────────────────────────────────────────────────────────────────────────
 def connect_radar() -> RadarSensor:
-    log.info("Scanning for Texas Instruments USB ports...")
-    cli, data = RadarSensor.find_ti_ports()
+    log.info("Connecting to Texas Instruments hardware...")
+    
+    cli, data = None, None
+    if HW_CLI_PORT.lower() != 'auto' and HW_DATA_PORT.lower() != 'auto':
+        cli, data = HW_CLI_PORT, HW_DATA_PORT
+    else:
+        log.info("Scanning for auto-assigned USB ports...")
+        cli, data = RadarSensor.find_ti_ports()
     
     if not cli or not data:
-        log.error("Ports not found. Please check the USB connection to the radar.")
+        log.error("Failed: No TI radar ports found. Please check connections or manually set them in settings.ini.")
         return None
 
-    log.info(f"Found CLI: {cli} | DATA: {data}")
+    log.info(f"Using CLI: {cli} | DATA: {data}")
     
-    # Initialize hardware and send configuration file
-    radar = RadarSensor(cli, data, "core/config.cfg")
+    radar = RadarSensor(cli, data, HW_CFG_FILE)
     radar.connect_and_configure()
     
-    # Print the derived radar parameters to the terminal prominently
     print("\n" + "="*40)
     print(" RADAR CONFIGURATION LOADED")
     print("="*40)
@@ -101,73 +106,52 @@ def connect_radar() -> RadarSensor:
     
     return radar
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  Core Streaming Loop (Handles both Preview and Record)
+#  Core Streaming Loop
 # ─────────────────────────────────────────────────────────────────────────────
 def run_stream(zmq_socket: zmq.Socket, record: bool):
-    """
-    Connects to the radar, streams data to ZMQ, and optionally writes to Parquet.
-    Blocks until the user presses Ctrl+C.
-    """
     radar = connect_radar()
-    if radar is None:
-        return  # Failed to connect, drop back to menu
+    if radar is None: return
 
-    writer = None
-    if record:
-        writer = RadarSessionWriter(metadata=radar.config.summary())
-        log.info(f"RECORD MODE: Broadcasting over ZMQ and saving to {writer.filepath}")
-    else:
-        log.info("PREVIEW MODE: Broadcasting over ZMQ only (No disk writing).")
+    writer = RadarSessionWriter(metadata=radar.config.summary()) if record else None
+    
+    if record: log.info(f"RECORD MODE: Broadcasting over ZMQ and saving to {writer.filepath}")
+    else: log.info("PREVIEW MODE: Broadcasting over ZMQ only (No disk writing).")
 
     print("\n>>> STREAM ACTIVE. Press Ctrl+C to stop and return to menu. <<<\n")
     
     try:
         while True:
             raw_bytes = radar.read_raw_frame()
-            
             if raw_bytes is None:
                 time.sleep(0.001)
                 continue
 
-            # Parse the incoming packet for the RDHM payload
             frame = parse_standard_frame(raw_bytes)
             rdhm = frame.get("RDHM")
             
             if rdhm is not None:
-                # 1. Always broadcast to the Subscriber UI
                 zmq_socket.send(rdhm.tobytes())
-                
-                # 2. If in record mode, save to disk
-                if record:
-                    writer.write_frame(rdhm)
+                if record: writer.write_frame(rdhm)
 
     except KeyboardInterrupt:
         log.info("Ctrl+C detected. Stopping stream...")
-        
     finally:
-        # Stop the hardware chirping and close USB ports cleanly
         radar.close()
-        
-        if writer:
-            writer.close()
-        
-        time.sleep(0.5) # Brief pause to let ports fully release
-
+        if writer: writer.close()
+        time.sleep(0.5)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Main Application Menu
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    # Setup the background ZeroMQ socket once
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
-    socket.bind("tcp://*:5555")
+    socket.bind(f"tcp://*:{ZMQ_PORT}")
     
     print("=========================================")
     print(f"                OST RADAR v{VERSION}       ")
-    print("        ZMQ Bound to tcp://*:5555        ")
+    print(f"        ZMQ Bound to tcp://*:{ZMQ_PORT}    ")
     print("=========================================")
 
     while True:
@@ -178,17 +162,13 @@ def main():
         
         choice = input("\nSelect an option (1-3): ").strip()
         
-        if choice == '1':
-            run_stream(socket, record=False)
-        elif choice == '2':
-            run_stream(socket, record=True)
+        if choice == '1': run_stream(socket, record=False)
+        elif choice == '2': run_stream(socket, record=True)
         elif choice == '3':
             print("Shutting down network and exiting...")
             break
-        else:
-            print("Invalid choice. Please enter 1, 2, or 3.")
+        else: print("Invalid choice.")
 
-    # Clean up network resources before full exit
     socket.close()
     context.term()
     sys.exit(0)
