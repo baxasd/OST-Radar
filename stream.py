@@ -82,8 +82,8 @@ def connect_radar() -> RadarSensor:
     cli, data = RadarSensor.find_ti_ports()
     
     if not cli or not data:
-        log.error("Ports not found. Please check the USB connection to the radar.")
-        return None
+        log.error("Auto-detection failed: No TI radar ports found. Please check connections and try again.")
+        cli, data = "/dev/ttyUSB0", "/dev/ttyUSB1"
 
     log.info(f"Found CLI: {cli} | DATA: {data}")
     
