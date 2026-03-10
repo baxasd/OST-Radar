@@ -89,7 +89,7 @@ def connect_radar() -> RadarSensor:
         cli, data = RadarSensor.find_ti_ports()
     
     if not cli or not data:
-        log.error("Failed: No TI radar ports found. Please check connections or manually set them in settings.ini.")
+        log.error("Auto-detection failed: No TI radar ports found. Please check connections and try again.")
         return None
 
     log.info(f"Using CLI: {cli} | DATA: {data}")
